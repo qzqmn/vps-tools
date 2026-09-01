@@ -335,13 +335,13 @@ EOF
     pause_prompt
 }
 
-# 7. Docker 服務冷備份 (帶卡死校驗鎖)、雲端同步與還原
+# 7. Docker 服務冷備份 (帶卡死校驗鎖)、雲端同步與還原 (支援 空格多選 / 單選 / 全選)
 backup_and_migrate() {
     while true; do
         clear
         echo -e "${BLUE}=== 7. Docker 服務搬機、雲端同步 (Rclone) 與還原 ===${NC}"
-        echo " [1] 打包服務並同步至 雲端網盤 / 新 VPS"
-        echo " [2] 從 Rclone 雲端 / 本機拉取備份檔並還原啟動"
+        echo " [1] 打包服務並同步至 雲端網盤 / 新 VPS (支援 多選/單選/ALL)"
+        echo " [2] 從 Rclone 雲端 / 本機拉取備份檔並按需還原啟動"
         echo " [3] 配置 / 綁定 Rclone 雲端網盤 (rclone config)"
         echo " [0] 返回主選單"
         read -p "請選擇 [0-3]: " sub_choice
@@ -364,68 +364,96 @@ backup_and_migrate() {
                 for i in "${!SERVICES[@]}"; do
                     echo " [$((i+1))] ${SERVICES[$i]}"
                 done
+                echo "---------------------------------------------------"
                 echo " [A] 打包全部服務 (ALL)"
                 echo " [0] 取消並返回"
                 echo "---------------------------------------------------"
-                read -p "請選擇要打包的服務編號 [0-$(( ${#SERVICES[@]} )), A]: " s_choice
+                read -p "請選擇要打包的服務編號 (多選請用空格隔開，例如: 1 3 或 A): " input_choice
 
-                SERVICE_NAME=""
-                if [[ "$s_choice" =~ ^[Aa]$ ]]; then
-                    SERVICE_NAME="all"
-                elif [[ "$s_choice" =~ ^[0-9]+$ ]] && [ "$s_choice" -ge 1 ] && [ "$s_choice" -le "${#SERVICES[@]}" ]; then
-                    SERVICE_NAME="${SERVICES[$((s_choice-1))]}"
-                elif [ "$s_choice" = "0" ]; then
+                if [ "$input_choice" = "0" ] || [ -z "$input_choice" ]; then
                     continue
+                fi
+
+                SELECTED_SERVICES=()
+                IS_ALL=false
+
+                if [[ "$input_choice" =~ ^[Aa]$ ]]; then
+                    IS_ALL=true
+                    SELECTED_SERVICES=("${SERVICES[@]}")
                 else
-                    echo -e "${RED}❌ 無效選項！${NC}"
+                    for num in $input_choice; do
+                        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#SERVICES[@]}" ]; then
+                            SELECTED_SERVICES+=("${SERVICES[$((num-1))]}")
+                        fi
+                    done
+                fi
+
+                # 剔除重複選擇
+                SELECTED_SERVICES=($(echo "${SELECTED_SERVICES[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+
+                if [ ${#SELECTED_SERVICES[@]} -eq 0 ]; then
+                    echo -e "${RED}❌ 無效選擇！${NC}"
                     pause_prompt
                     continue
                 fi
+
+                echo -e "${YELLOW}你已選擇打包以下服務: ${GREEN}${SELECTED_SERVICES[*]}${NC}"
 
                 read -p "是否先停止相關 Docker 容器以進行【冷備份】(確保數據 100% 一致)？(Y/n): " do_cold
                 do_cold=${do_cold:-Y}
 
                 STOPPED_CONTAINERS=()
+                STUCK_DETECTED=false
+
                 if [[ "$do_cold" =~ ^[Yy]$ ]]; then
-                    echo -e "${YELLOW}正在停止 Docker 容器以準備冷備份...${NC}"
-                    if [ "$SERVICE_NAME" = "all" ]; then
+                    echo -e "${YELLOW}正在停止相關 Docker 容器以準備冷備份...${NC}"
+                    if [ "$IS_ALL" = true ]; then
                         STOPPED_CONTAINERS=($(docker ps -q))
                         if [ ${#STOPPED_CONTAINERS[@]} -gt 0 ]; then
                             docker stop "${STOPPED_CONTAINERS[@]}" > /dev/null
-                            
                             REMAINING_RUNNING=$(docker ps -q)
                             if [ -n "$REMAINING_RUNNING" ]; then
-                                echo -e "${RED}❌ 嚴重警告：機器反應過慢或容器卡死，仍有容器未完全關閉！${NC}"
-                                echo -e "${RED}為避免備份損毀數據，腳本已強行中止備份程序！${NC}"
-                                pause_prompt
-                                continue
+                                STUCK_DETECTED=true
                             fi
-                            echo -e "${GREEN}✓ 已停止並驗證所有 Docker 容器無殘留！${NC}"
                         fi
                     else
-                        TARGET_DIR="$DOCKER_DATA_DIR/$SERVICE_NAME"
-                        if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
-                            (cd "$TARGET_DIR" && docker compose down > /dev/null 2>&1)
-                            
-                            IS_RUNNING=$(cd "$TARGET_DIR" && docker compose ps --services --filter "status=running" 2>/dev/null)
-                            if [ -n "$IS_RUNNING" ]; then
-                                echo -e "${RED}❌ 嚴重警告：服務 $SERVICE_NAME 下仍有容器在運行 (卡死狀態)！${NC}"
-                                echo -e "${RED}為避免備份損毀數據，腳本已強行中止備份程序！${NC}"
-                                pause_prompt
-                                continue
+                        for s_name in "${SELECTED_SERVICES[@]}"; do
+                            TARGET_DIR="$DOCKER_DATA_DIR/$s_name"
+                            if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
+                                (cd "$TARGET_DIR" && docker compose down > /dev/null 2>&1)
+                                IS_RUNNING=$(cd "$TARGET_DIR" && docker compose ps --services --filter "status=running" 2>/dev/null)
+                                if [ -n "$IS_RUNNING" ]; then
+                                    STUCK_DETECTED=true
+                                fi
                             fi
-                            echo -e "${GREEN}✓ 已暫停並驗證 $SERVICE_NAME 容器完全關閉！${NC}"
-                        fi
+                        done
                     fi
+
+                    if [ "$STUCK_DETECTED" = true ]; then
+                        echo -e "${RED}❌ 嚴重警告：機器反應過慢或容器卡死，仍有容器未完全關閉！${NC}"
+                        echo -e "${RED}為避免備份損毀數據，腳本已強行中止備份程序！${NC}"
+                        pause_prompt
+                        continue
+                    fi
+                    echo -e "${GREEN}✓ 已停止並驗證選定容器完全關閉！${NC}"
                 fi
 
                 echo -e "${BLUE}正在打包中...${NC}"
-                if [ "$SERVICE_NAME" = "all" ]; then
-                    BACKUP_FILE="/tmp/docker_data_ALL_$(date +%Y%m%d_%H%M%S).tar.gz"
+                TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                
+                if [ "$IS_ALL" = true ]; then
+                    BACKUP_FILE="/tmp/docker_data_ALL_${TIMESTAMP}.tar.gz"
                     tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" . > /dev/null 2>&1
+                elif [ ${#SELECTED_SERVICES[@]} -eq 1 ]; then
+                    BACKUP_FILE="/tmp/${SELECTED_SERVICES[0]}_backup_${TIMESTAMP}.tar.gz"
+                    tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" "${SELECTED_SERVICES[0]}" > /dev/null 2>&1
                 else
-                    BACKUP_FILE="/tmp/${SERVICE_NAME}_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-                    tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" "$SERVICE_NAME" > /dev/null 2>&1
+                    BACKUP_FILE="/tmp/docker_data_CUSTOM_${TIMESTAMP}.tar.gz"
+                    TAR_PATHS=()
+                    for s_name in "${SELECTED_SERVICES[@]}"; do
+                        TAR_PATHS+=("$s_name")
+                    done
+                    tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" "${TAR_PATHS[@]}" > /dev/null 2>&1
                 fi
 
                 if [ $? -eq 0 ] && [ -f "$BACKUP_FILE" ]; then
@@ -436,17 +464,19 @@ backup_and_migrate() {
 
                 if [[ "$do_cold" =~ ^[Yy]$ ]]; then
                     echo -e "${BLUE}正在恢復 Docker 容器...${NC}"
-                    if [ "$SERVICE_NAME" = "all" ]; then
+                    if [ "$IS_ALL" = true ]; then
                         if [ ${#STOPPED_CONTAINERS[@]} -gt 0 ]; then
                             docker start "${STOPPED_CONTAINERS[@]}" > /dev/null
                             echo -e "${GREEN}✓ 所有 Docker 容器已重新啟動！${NC}"
                         fi
                     else
-                        TARGET_DIR="$DOCKER_DATA_DIR/$SERVICE_NAME"
-                        if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
-                            (cd "$TARGET_DIR" && docker compose up -d > /dev/null 2>&1)
-                            echo -e "${GREEN}✓ $SERVICE_NAME 服務已重新啟動！${NC}"
-                        fi
+                        for s_name in "${SELECTED_SERVICES[@]}"; do
+                            TARGET_DIR="$DOCKER_DATA_DIR/$s_name"
+                            if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
+                                (cd "$TARGET_DIR" && docker compose up -d > /dev/null 2>&1)
+                            fi
+                        done
+                        echo -e "${GREEN}✓ 已重啟選定的 Docker 服務！${NC}"
                     fi
                 fi
 
@@ -546,12 +576,48 @@ backup_and_migrate() {
                     continue
                 fi
 
+                # 讀取備份包內的服務清單
+                INSIDE_SERVICES=($(tar -tzf "$SELECTED_FILE" | awk -F'/' '{print $1}' | grep -v '^\.' | grep -v '^$' | sort -u))
+
+                if [ ${#INSIDE_SERVICES[@]} -eq 0 ]; then
+                    # 嘗試備份時包含 -C 的結構解析
+                    INSIDE_SERVICES=($(tar -tzf "$SELECTED_FILE" | awk -F'/' '{print $1}' | sort -u))
+                fi
+
+                echo -e "\n${BLUE}--- 檢測到備份包內含有以下 Docker 服務 ---${NC}"
+                for i in "${!INSIDE_SERVICES[@]}"; do
+                    echo " [$((i+1))] ${INSIDE_SERVICES[$i]}"
+                done
+                echo "---------------------------------------------------"
+                echo " [A] 還原全部服務 (ALL)"
+                echo "---------------------------------------------------"
+                read -p "請選擇要還原的服務編號 (多選請用空格隔開，例如: 1 3 或 A): " r_choice
+
+                TO_RESTORE=()
+                if [[ "$r_choice" =~ ^[Aa]$ ]]; then
+                    TO_RESTORE=("${INSIDE_SERVICES[@]}")
+                else
+                    for num in $r_choice; do
+                        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#INSIDE_SERVICES[@]}" ]; then
+                            TO_RESTORE+=("${INSIDE_SERVICES[$((num-1))]}")
+                        fi
+                    done
+                fi
+
+                TO_RESTORE=($(echo "${TO_RESTORE[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+
+                if [ ${#TO_RESTORE[@]} -eq 0 ]; then
+                    echo -e "${RED}❌ 未選擇任何服務，已取消還原。${NC}"
+                    pause_prompt
+                    continue
+                fi
+
                 FILE_SIZE=$(du -h "$SELECTED_FILE" | awk '{print $1}')
                 echo -e "\n${YELLOW}=== 還原操作二次確認 ===${NC}"
-                echo -e " 📦 準備還原檔案: ${GREEN}$SELECTED_FILE${NC}"
-                echo -e " 📏 檔案大小: ${GREEN}$FILE_SIZE${NC}"
-                echo -e " 📂 解壓目標路徑: ${GREEN}$DOCKER_DATA_DIR${NC}"
-                echo -e "${RED}⚠️ 注意：若 $DOCKER_DATA_DIR 下存在同名資料夾，舊數據將被覆蓋！${NC}"
+                echo -e " 📦 備份來源檔: ${GREEN}$SELECTED_FILE${NC} ($FILE_SIZE)"
+                echo -e " 🎯 準備還原服務: ${GREEN}${TO_RESTORE[*]}${NC}"
+                echo -e " 📂 目標資料夾: ${GREEN}$DOCKER_DATA_DIR${NC}"
+                echo -e "${RED}⚠️ 注意：若 $DOCKER_DATA_DIR 下存在同名資料夾，數據將會被覆蓋！${NC}"
                 read -p "確定要開始解壓還原嗎？(y/N): " confirm_restore
 
                 if [[ ! "$confirm_restore" =~ ^[Yy]$ ]]; then
@@ -560,28 +626,32 @@ backup_and_migrate() {
                     continue
                 fi
 
-                echo -e "${BLUE}正在解壓 $SELECTED_FILE 到 $DOCKER_DATA_DIR ...${NC}"
+                echo -e "${BLUE}正在精準解壓選定的服務到 $DOCKER_DATA_DIR ...${NC}"
                 mkdir -p "$DOCKER_DATA_DIR"
-                tar -xzvf "$SELECTED_FILE" -C "$DOCKER_DATA_DIR"
+
+                EXTRACT_ARGS=()
+                for s in "${TO_RESTORE[@]}"; do
+                    EXTRACT_ARGS+=("$s")
+                done
+
+                tar -xzvf "$SELECTED_FILE" -C "$DOCKER_DATA_DIR" "${EXTRACT_ARGS[@]}"
                 
                 if [ $? -eq 0 ]; then
-                    echo -e "${GREEN}✓ 解壓完成！${NC}"
+                    echo -e "${GREEN}✓ 選定服務已成功解壓！${NC}"
                     
-                    read -p "請輸入剛剛還原的服務資料夾名稱 (用於啟動 Compose): " RESTORED_NAME
-                    RESTORED_DIR="$DOCKER_DATA_DIR/$RESTORED_NAME"
-                    
-                    if [ -d "$RESTORED_DIR" ]; then
-                        if [ -f "$RESTORED_DIR/docker-compose.yml" ] || [ -f "$RESTORED_DIR/docker-compose.yaml" ]; then
-                            read -p "偵測到 docker-compose 檔，是否立即啟動服務？(Y/n): " start_now
-                            if [[ ! "$start_now" =~ ^[Nn]$ ]]; then
-                                echo -e "${BLUE}正在啟動服務...${NC}"
-                                (cd "$RESTORED_DIR" && docker compose up -d)
-                                echo -e "${GREEN}✓ 服務已成功啟動！${NC}"
+                    read -p "是否立即自動檢測並啟動已還原服務的 Compose？(Y/n): " start_restored
+                    if [[ ! "$start_restored" =~ ^[Nn]$ ]]; then
+                        echo -e "${BLUE}正在啟動服務...${NC}"
+                        for s in "${TO_RESTORE[@]}"; do
+                            R_DIR="$DOCKER_DATA_DIR/$s"
+                            if [ -f "$R_DIR/docker-compose.yml" ] || [ -f "$R_DIR/docker-compose.yaml" ]; then
+                                (cd "$R_DIR" && docker compose up -d)
+                                echo -e "${GREEN}✓ $s 服務已啟動！${NC}"
                             fi
-                        fi
+                        done
                     fi
                 else
-                    echo -e "${RED}❌ 解壓失敗，請檢查檔案是否完整。${NC}"
+                    echo -e "${RED}❌ 解壓失敗，請檢查備份檔格式或資料夾名稱。${NC}"
                 fi
                 pause_prompt
                 ;;
