@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Boss 的 VPS 智囊管理腳本 v2.4.0 (Rclone Deep Integration)
-# 功能：全套系統初始化、SSH安全、Docker管理、進階運維選單、雲端備份還原
+# Boss 的 VPS 智囊管理腳本 v2.5.0 (Rclone Dynamic Docker/CLI Integration)
+# 功能：全套系統初始化、SSH安全、Docker管理、進階運維選單、雲端備份與還原
 # ===================================================
 
 RED='\033[0;31m'
@@ -22,17 +22,50 @@ pause_prompt() {
     read -p "按下 Enter 鍵繼續..." temp
 }
 
-# 檢查與安裝 Rclone
+# 檢查與安裝 Rclone (提供 二進制 / Docker 選擇機制)
 check_and_install_rclone() {
     if ! command -v rclone &> /dev/null; then
         echo -e "${YELLOW}⚠️ 偵測到系統尚未安裝 Rclone。${NC}"
-        read -p "是否現在為你安裝 Rclone？(y/N): " install_rc
-        if [[ "$install_rc" =~ ^[Yy]$ ]]; then
-            curl https://rclone.org/install.sh | bash
-            echo -e "${GREEN}✓ Rclone 安裝完成！${NC}"
-        else
-            return 1
-        fi
+        echo " [1] 安裝系統二進制版 (原生 CLI，推薦與本腳本整合)"
+        echo " [2] 使用 Docker 部署 Rclone 容器 (免常駐，資料統一放 /docker-data/rclone)"
+        echo " [0] 取消並返回"
+        read -p "請選擇安裝方式 [0-2]: " rc_install_choice
+
+        case $rc_install_choice in
+            1)
+                echo -e "${BLUE}正在安裝 Rclone 系統二進制版...${NC}"
+                curl https://rclone.org/install.sh | bash
+                if command -v rclone &> /dev/null; then
+                    echo -e "${GREEN}✓ Rclone 二進制版安裝完成！${NC}"
+                    return 0
+                else
+                    echo -e "${RED}❌ 安裝失敗，請檢查網絡連線！${NC}"
+                    return 1
+                fi
+                ;;
+            2)
+                echo -e "${BLUE}正在以 Docker 拉取 Rclone 映像檔...${NC}"
+                mkdir -p /docker-data/rclone/config /docker-data/rclone/data
+                docker pull rclone/rclone:latest
+                
+                # 建立 CLI 封裝腳本 (用完即銷毀，免常駐，自動映射 /docker-data 與 /tmp)
+                cat << 'EOF' > /usr/local/bin/rclone
+#!/bin/bash
+docker run --rm -it \
+  -v /docker-data/rclone/config:/config/rclone \
+  -v /docker-data:/docker-data \
+  -v /tmp:/tmp \
+  rclone/rclone:latest "$@"
+EOF
+                chmod +x /usr/local/bin/rclone
+                echo -e "${GREEN}✓ Rclone Docker 部署與 CLI 封裝完成！${NC}"
+                return 0
+                ;;
+            *)
+                echo -e "${YELLOW}已取消安裝。${NC}"
+                return 1
+                ;;
+        esac
     fi
     return 0
 }
@@ -252,13 +285,13 @@ EOF
     pause_prompt
 }
 
-# 7. Docker 服務搬機、雲端同步 (Rclone) 與一鍵還原
+# 7. Docker 服務搬機、雲端同步 (Rclone) 與還原
 backup_and_migrate() {
     while true; do
         clear
         echo -e "${BLUE}=== 7. Docker 服務搬機、雲端同步 (Rclone) 與還原 ===${NC}"
         echo " [1] 打包服務並同步至 雲端網盤 / 新 VPS"
-        echo " [2] 從 Rclone 雲端 / 本機拉取備份並一鍵還原啟動"
+        echo " [2] 從 Rclone 雲端 / 本機拉取備份檔並還原啟動"
         echo " [3] 配置 / 綁定 Rclone 雲端網盤 (rclone config)"
         echo " [0] 返回主選單"
         read -p "請選擇 [0-3]: " sub_choice
@@ -385,7 +418,7 @@ backup_and_migrate() {
                     fi
                 fi
 
-                # 若沒有從雲端下載，則掃描本機 /tmp
+                # 若未從雲端下載，掃描本機 /tmp
                 if [ -z "$SELECTED_FILE" ]; then
                     echo "掃描 /tmp/ 目錄下的備份檔："
                     BACKUP_LIST=($(ls /tmp/*.tar.gz 2>/dev/null))
@@ -404,6 +437,21 @@ backup_and_migrate() {
 
                 if [ ! -f "$SELECTED_FILE" ]; then
                     echo -e "${RED}錯誤：檔案 $SELECTED_FILE 不存在！${NC}"
+                    pause_prompt
+                    continue
+                fi
+
+                # 審計重點：還原前檔名與大小二次確認
+                FILE_SIZE=$(du -h "$SELECTED_FILE" | awk '{print $1}')
+                echo -e "\n${YELLOW}=== 還原操作二次確認 ===${NC}"
+                echo -e " 📦 準備還原檔案: ${GREEN}$SELECTED_FILE${NC}"
+                echo -e " 📏 檔案大小: ${GREEN}$FILE_SIZE${NC}"
+                echo -e " 📂 解壓目標路徑: ${GREEN}$DOCKER_DATA_DIR${NC}"
+                echo -e "${RED}⚠️ 注意：若 $DOCKER_DATA_DIR 下存在同名資料夾，舊數據將被覆蓋！${NC}"
+                read -p "確定要開始解壓還原嗎？(y/N): " confirm_restore
+
+                if [[ ! "$confirm_restore" =~ ^[Yy]$ ]]; then
+                    echo -e "${YELLOW}已取消還原操作。${NC}"
                     pause_prompt
                     continue
                 fi
@@ -449,7 +497,7 @@ backup_and_migrate() {
     done
 }
 
-# 8. 系統效能與網路速測
+# 8. 系統效能與網絡速測
 test_performance() {
     while true; do
         clear
@@ -771,7 +819,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${GREEN}===================================================${NC}"
-        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.4.0             ${NC}"
+        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.5.0             ${NC}"
         echo -e "${GREEN}===================================================${NC}"
         echo " [1]  🚀 基礎初始化 (安裝 Docker / 建立 docker-data)"
         echo " [2]  🔒 SSH Port 管理 (獨立改 Port / 雙 Port 防鎖死)"
