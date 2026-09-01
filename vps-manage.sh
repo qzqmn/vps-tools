@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Boss 的 VPS 智囊管理腳本 v2.5.0 (Rclone Dynamic Docker/CLI Integration)
-# 功能：全套系統初始化、SSH安全、Docker管理、進階運維選單、雲端備份與還原
+# Boss 的 VPS 智囊管理腳本 v2.8.0 (Full Security Checks & Mandatory Consent)
+# 功能：全套系統初始化、SSH安全、Docker冷備份(帶卡死鎖)、雲端同步與選單管理
 # ===================================================
 
 RED='\033[0;31m'
@@ -22,14 +22,14 @@ pause_prompt() {
     read -p "按下 Enter 鍵繼續..." temp
 }
 
-# 檢查與安裝 Rclone (提供 二進制 / Docker 選擇機制)
+# 檢查與安裝 Rclone (發現未安裝 -> 報告 -> 詢問授權)
 check_and_install_rclone() {
     if ! command -v rclone &> /dev/null; then
-        echo -e "${YELLOW}⚠️ 偵測到系統尚未安裝 Rclone。${NC}"
-        echo " [1] 安裝系統二進制版 (原生 CLI，推薦與本腳本整合)"
-        echo " [2] 使用 Docker 部署 Rclone 容器 (免常駐，資料統一放 /docker-data/rclone)"
+        echo -e "${YELLOW}⚠️ 報告 Boss：偵測到系統尚未安裝 Rclone 雲端同步工具。${NC}"
+        echo " [1] 安裝系統二進制版 (原生 CLI)"
+        echo " [2] 使用 Docker 部署 Rclone 容器 (目錄: /docker-data/rclone)"
         echo " [0] 取消並返回"
-        read -p "請選擇安裝方式 [0-2]: " rc_install_choice
+        read -p "是否執行安裝？請選擇 [0-2]: " rc_install_choice
 
         case $rc_install_choice in
             1)
@@ -48,7 +48,6 @@ check_and_install_rclone() {
                 mkdir -p /docker-data/rclone/config /docker-data/rclone/data
                 docker pull rclone/rclone:latest
                 
-                # 建立 CLI 封裝腳本 (用完即銷毀，免常駐，自動映射 /docker-data 與 /tmp)
                 cat << 'EOF' > /usr/local/bin/rclone
 #!/bin/bash
 docker run --rm -it \
@@ -70,10 +69,54 @@ EOF
     return 0
 }
 
+# 檢查與安裝 UFW 防火牆 (發現未安裝 -> 報告 -> 詢問授權)
+check_and_install_ufw() {
+    if ! command -v ufw &> /dev/null; then
+        echo -e "${YELLOW}⚠️ 報告 Boss：偵測到系統尚未安裝 UFW 防火牆。${NC}"
+        read -p "是否現在為你安裝 UFW 防火牆？(y/N): " install_ufw
+        if [[ "$install_ufw" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}正在安裝 UFW...${NC}"
+            apt-get update && apt-get install -y ufw
+            echo -e "${GREEN}✓ UFW 安裝完成！${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}已取消 UFW 安裝操作。${NC}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# 檢查與安裝 Fail2ban (發現未安裝 -> 報告 -> 詢問授權)
+check_and_install_fail2ban() {
+    if ! command -v fail2ban-client &> /dev/null; then
+        echo -e "${YELLOW}⚠️ 報告 Boss：偵測到系統尚未安裝 Fail2ban 防爆破工具。${NC}"
+        read -p "是否現在為你安裝 Fail2ban？(y/N): " install_f2b
+        if [[ "$install_f2b" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}正在安裝 Fail2ban...${NC}"
+            apt-get update && apt-get install -y fail2ban
+            echo -e "${GREEN}✓ Fail2ban 安裝完成！${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}已取消 Fail2ban 安裝操作。${NC}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # 1. 基礎初始化
 init_system() {
     echo -e "${BLUE}=== 1. 基礎系統初始化與 Docker 安裝 ===${NC}"
-    apt-get update && apt-get install -y curl wget git ufw fail2ban jq tar openssh-client sysbench
+    echo -e "${YELLOW}此操作將為 VPS 安裝基礎工具 (curl, wget, git, jq, tar) 與 Docker。${NC}"
+    read -p "確定要開始初始化嗎？(y/N): " confirm_init
+    if [[ ! "$confirm_init" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}已取消初始化。${NC}"
+        pause_prompt
+        return
+    fi
+
+    apt-get update && apt-get install -y curl wget git jq tar openssh-client sysbench
 
     if [ ! -d "$DOCKER_DATA_DIR" ]; then
         mkdir -p "$DOCKER_DATA_DIR"
@@ -131,7 +174,7 @@ disable_ssh_password() {
     
     if [ ! -s ~/.ssh/authorized_keys ]; then
         echo -e "${RED}❌ 嚴格警告：偵測到 ~/.ssh/authorized_keys 為空或不存在！${NC}"
-        echo -e "${RED}若此時關閉密碼登入，你將永遠無法登入此 VPS。請先到選項 [4] 注入 SSH Key！${NC}"
+        echo -e "${RED}若此時關閉密碼登入， Boss 將永遠無法登入此 VPS。請先到選項 [4] 注入 SSH Key！${NC}"
         pause_prompt
         return
     fi
@@ -210,9 +253,16 @@ manage_ssh_keys() {
     done
 }
 
-# 5. Fail2ban 設定
+# 5. Fail2ban 設定 (含授權安裝機制)
 setup_fail2ban() {
     echo -e "${BLUE}=== 5. 配置 Fail2ban 防爆破 ===${NC}"
+    
+    check_and_install_fail2ban
+    if [ $? -ne 0 ]; then
+        pause_prompt
+        return
+    fi
+
     read -p "請輸入 IP 白名單 (如 Tailscale IP，留空跳過): " MY_IP
     current_port=$(ss -tulpn | grep sshd | awk '{print $5}' | awk -F: '{print $NF}' | head -n 1)
     ssh_port=${current_port:-22}
@@ -231,7 +281,7 @@ EOF
 
     systemctl restart fail2ban
     systemctl enable fail2ban
-    echo -e "${GREEN}✓ Fail2ban 已配置 (監控 Port: $ssh_port)${NC}"
+    echo -e "${GREEN}✓ Fail2ban 已配置並啟用 (監控 Port: $ssh_port，封禁時間: 24小時)${NC}"
     pause_prompt
 }
 
@@ -285,7 +335,7 @@ EOF
     pause_prompt
 }
 
-# 7. Docker 服務搬機、雲端同步 (Rclone) 與還原
+# 7. Docker 服務冷備份 (帶卡死校驗鎖)、雲端同步與還原
 backup_and_migrate() {
     while true; do
         clear
@@ -298,58 +348,109 @@ backup_and_migrate() {
 
         case $sub_choice in
             1)
-                echo -e "\n當前 $DOCKER_DATA_DIR 下的服務："
-                ls -l $DOCKER_DATA_DIR | grep '^d' | awk '{print "  - "$9}'
-                echo "---------------------------------------------------"
-                read -p "請輸入要打包的服務名稱 (輸入 all 打包全部): " SERVICE_NAME
+                echo -e "\n${BLUE}--- 當前 $DOCKER_DATA_DIR 下的服務清單 ---${NC}"
+                
+                SERVICES=()
+                while IFS= read -r -d '' dir; do
+                    SERVICES+=("$(basename "$dir")")
+                done < <(find "$DOCKER_DATA_DIR" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
 
-                if [ -z "$SERVICE_NAME" ]; then
-                    echo -e "${RED}錯誤：服務名稱不能為空！${NC}"
+                if [ ${#SERVICES[@]} -eq 0 ]; then
+                    echo -e "${RED}❌ $DOCKER_DATA_DIR 下沒有找到任何服務資料夾！${NC}"
                     pause_prompt
                     continue
                 fi
 
-                if [ "$SERVICE_NAME" = "all" ]; then
-                    TARGET_DIR="$DOCKER_DATA_DIR"
-                    BACKUP_FILE="/tmp/docker_data_ALL_$(date +%Y%m%d_%H%M%S).tar.gz"
-                    TAR_CMD="tar -czvf $BACKUP_FILE -C $DOCKER_DATA_DIR ."
-                else
-                    TARGET_DIR="$DOCKER_DATA_DIR/$SERVICE_NAME"
-                    if [ ! -d "$TARGET_DIR" ]; then
-                        echo -e "${RED}錯誤：資料夾 $TARGET_DIR 不存在！${NC}"
-                        pause_prompt
-                        continue
-                    fi
-                    BACKUP_FILE="/tmp/${SERVICE_NAME}_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-                    TAR_CMD="tar -czvf $BACKUP_FILE -C $DOCKER_DATA_DIR $SERVICE_NAME"
+                for i in "${!SERVICES[@]}"; do
+                    echo " [$((i+1))] ${SERVICES[$i]}"
+                done
+                echo " [A] 打包全部服務 (ALL)"
+                echo " [0] 取消並返回"
+                echo "---------------------------------------------------"
+                read -p "請選擇要打包的服務編號 [0-$(( ${#SERVICES[@]} )), A]: " s_choice
 
-                    read -p "是否先停止該容器以確保數據一致 (冷備份)？(y/N): " stop_container
-                    if [[ "$stop_container" =~ ^[Yy]$ ]]; then
+                SERVICE_NAME=""
+                if [[ "$s_choice" =~ ^[Aa]$ ]]; then
+                    SERVICE_NAME="all"
+                elif [[ "$s_choice" =~ ^[0-9]+$ ]] && [ "$s_choice" -ge 1 ] && [ "$s_choice" -le "${#SERVICES[@]}" ]; then
+                    SERVICE_NAME="${SERVICES[$((s_choice-1))]}"
+                elif [ "$s_choice" = "0" ]; then
+                    continue
+                else
+                    echo -e "${RED}❌ 無效選項！${NC}"
+                    pause_prompt
+                    continue
+                fi
+
+                read -p "是否先停止相關 Docker 容器以進行【冷備份】(確保數據 100% 一致)？(Y/n): " do_cold
+                do_cold=${do_cold:-Y}
+
+                STOPPED_CONTAINERS=()
+                if [[ "$do_cold" =~ ^[Yy]$ ]]; then
+                    echo -e "${YELLOW}正在停止 Docker 容器以準備冷備份...${NC}"
+                    if [ "$SERVICE_NAME" = "all" ]; then
+                        STOPPED_CONTAINERS=($(docker ps -q))
+                        if [ ${#STOPPED_CONTAINERS[@]} -gt 0 ]; then
+                            docker stop "${STOPPED_CONTAINERS[@]}" > /dev/null
+                            
+                            REMAINING_RUNNING=$(docker ps -q)
+                            if [ -n "$REMAINING_RUNNING" ]; then
+                                echo -e "${RED}❌ 嚴重警告：機器反應過慢或容器卡死，仍有容器未完全關閉！${NC}"
+                                echo -e "${RED}為避免備份損毀數據，腳本已強行中止備份程序！${NC}"
+                                pause_prompt
+                                continue
+                            fi
+                            echo -e "${GREEN}✓ 已停止並驗證所有 Docker 容器無殘留！${NC}"
+                        fi
+                    else
+                        TARGET_DIR="$DOCKER_DATA_DIR/$SERVICE_NAME"
                         if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
-                            echo -e "${YELLOW}正在停止 Docker 容器...${NC}"
-                            (cd "$TARGET_DIR" && docker compose down)
+                            (cd "$TARGET_DIR" && docker compose down > /dev/null 2>&1)
+                            
+                            IS_RUNNING=$(cd "$TARGET_DIR" && docker compose ps --services --filter "status=running" 2>/dev/null)
+                            if [ -n "$IS_RUNNING" ]; then
+                                echo -e "${RED}❌ 嚴重警告：服務 $SERVICE_NAME 下仍有容器在運行 (卡死狀態)！${NC}"
+                                echo -e "${RED}為避免備份損毀數據，腳本已強行中止備份程序！${NC}"
+                                pause_prompt
+                                continue
+                            fi
+                            echo -e "${GREEN}✓ 已暫停並驗證 $SERVICE_NAME 容器完全關閉！${NC}"
                         fi
                     fi
                 fi
 
                 echo -e "${BLUE}正在打包中...${NC}"
-                $TAR_CMD > /dev/null 2>&1
-                
+                if [ "$SERVICE_NAME" = "all" ]; then
+                    BACKUP_FILE="/tmp/docker_data_ALL_$(date +%Y%m%d_%H%M%S).tar.gz"
+                    tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" . > /dev/null 2>&1
+                else
+                    BACKUP_FILE="/tmp/${SERVICE_NAME}_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+                    tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" "$SERVICE_NAME" > /dev/null 2>&1
+                fi
+
                 if [ $? -eq 0 ] && [ -f "$BACKUP_FILE" ]; then
                     echo -e "${GREEN}✓ 備份成功：$BACKUP_FILE${NC}"
                 else
-                    echo -e "${RED}❌ 打包失敗！請檢查硬碟空間或權限。${NC}"
-                    pause_prompt
-                    continue
+                    echo -e "${RED}❌ 打包失敗！請檢查硬碟空間。${NC}"
                 fi
 
-                if [ "$SERVICE_NAME" != "all" ] && [[ "$stop_container" =~ ^[Yy]$ ]]; then
-                    echo -e "${BLUE}正在重啟 Docker 容器...${NC}"
-                    (cd "$TARGET_DIR" && docker compose up -d)
+                if [[ "$do_cold" =~ ^[Yy]$ ]]; then
+                    echo -e "${BLUE}正在恢復 Docker 容器...${NC}"
+                    if [ "$SERVICE_NAME" = "all" ]; then
+                        if [ ${#STOPPED_CONTAINERS[@]} -gt 0 ]; then
+                            docker start "${STOPPED_CONTAINERS[@]}" > /dev/null
+                            echo -e "${GREEN}✓ 所有 Docker 容器已重新啟動！${NC}"
+                        fi
+                    else
+                        TARGET_DIR="$DOCKER_DATA_DIR/$SERVICE_NAME"
+                        if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
+                            (cd "$TARGET_DIR" && docker compose up -d > /dev/null 2>&1)
+                            echo -e "${GREEN}✓ $SERVICE_NAME 服務已重新啟動！${NC}"
+                        fi
+                    fi
                 fi
 
-                # 上傳至 Rclone 雲端
-                if command -v rclone &> /dev/null; then
+                if check_and_install_rclone; then
                     read -p "是否同步備份檔至 Rclone 雲端網盤？(y/N): " do_rclone
                     if [[ "$do_rclone" =~ ^[Yy]$ ]]; then
                         echo -e "${YELLOW}現有 Rclone Remote 清單：${NC}"
@@ -367,7 +468,6 @@ backup_and_migrate() {
                     fi
                 fi
 
-                # SCP 傳送至新 VPS
                 read -p "是否直接 SCP 傳輸至新 VPS？(y/N): " do_push
                 if [[ "$do_push" =~ ^[Yy]$ ]]; then
                     read -p "請輸入新 VPS IP (可填 Tailscale IP): " NEW_IP
@@ -386,6 +486,12 @@ backup_and_migrate() {
                         echo -e "${RED}傳輸失敗，請檢查網絡連線或 SSH Key 權限。${NC}"
                     fi
                 fi
+
+                read -p "備份與傳輸已完成，是否刪除本機 /tmp 暫存檔 ($BACKUP_FILE)？(y/N): " rm_tmp
+                if [[ "$rm_tmp" =~ ^[Yy]$ ]]; then
+                    rm -f "$BACKUP_FILE"
+                    echo -e "${GREEN}✓ 已成功清除本機暫存檔！${NC}"
+                fi
                 pause_prompt
                 ;;
 
@@ -393,9 +499,9 @@ backup_and_migrate() {
                 echo -e "\n${BLUE}--- 還原備份檔至本機 ---${NC}"
                 SELECTED_FILE=""
 
-                if command -v rclone &> /dev/null; then
-                    read -p "是否從 Rclone 雲端網盤下載備份檔？(y/N): " from_cloud
-                    if [[ "$from_cloud" =~ ^[Yy]$ ]]; then
+                read -p "是否從 Rclone 雲端網盤下載備份檔？(y/N): " from_cloud
+                if [[ "$from_cloud" =~ ^[Yy]$ ]]; then
+                    if check_and_install_rclone; then
                         echo -e "${YELLOW}現有 Rclone Remote 清單：${NC}"
                         rclone listremotes
                         read -p "請輸入 Remote 路徑 (例如 drive:/backup): " CLOUD_PATH
@@ -418,7 +524,6 @@ backup_and_migrate() {
                     fi
                 fi
 
-                # 若未從雲端下載，掃描本機 /tmp
                 if [ -z "$SELECTED_FILE" ]; then
                     echo "掃描 /tmp/ 目錄下的備份檔："
                     BACKUP_LIST=($(ls /tmp/*.tar.gz 2>/dev/null))
@@ -441,7 +546,6 @@ backup_and_migrate() {
                     continue
                 fi
 
-                # 審計重點：還原前檔名與大小二次確認
                 FILE_SIZE=$(du -h "$SELECTED_FILE" | awk '{print $1}')
                 echo -e "\n${YELLOW}=== 還原操作二次確認 ===${NC}"
                 echo -e " 📦 準備還原檔案: ${GREEN}$SELECTED_FILE${NC}"
@@ -475,8 +579,6 @@ backup_and_migrate() {
                                 echo -e "${GREEN}✓ 服務已成功啟動！${NC}"
                             fi
                         fi
-                    else
-                        echo -e "${YELLOW}! 提示：$DOCKER_DATA_DIR/$RESTORED_NAME 目錄不存在，無法自動執行 compose。${NC}"
                     fi
                 else
                     echo -e "${RED}❌ 解壓失敗，請檢查檔案是否完整。${NC}"
@@ -485,8 +587,7 @@ backup_and_migrate() {
                 ;;
 
             3)
-                check_and_install_rclone
-                if [ $? -eq 0 ]; then
+                if check_and_install_rclone; then
                     rclone config
                 fi
                 pause_prompt
@@ -652,24 +753,7 @@ manage_swap() {
     done
 }
 
-# 11. UFW 防火牆常用 Port 管理 (含自由選擇安裝機制)
-check_and_install_ufw() {
-    if ! command -v ufw &> /dev/null; then
-        echo -e "${YELLOW}⚠️ 偵測到系統尚未安裝 UFW 防火牆。${NC}"
-        read -p "是否現在為你安裝 UFW 防火牆？(y/N): " install_ufw
-        if [[ "$install_ufw" =~ ^[Yy]$ ]]; then
-            echo -e "${BLUE}正在安裝 UFW...${NC}"
-            apt-get update && apt-get install -y ufw
-            echo -e "${GREEN}✓ UFW 安裝完成！${NC}"
-            return 0
-        else
-            echo -e "${RED}已取消操作，返回主選單。${NC}"
-            return 1
-        fi
-    fi
-    return 0
-}
-
+# 11. UFW 防火牆常用 Port 管理 (含授權安裝機制)
 manage_ufw_ports() {
     check_and_install_ufw
     if [ $? -ne 0 ]; then
@@ -819,7 +903,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${GREEN}===================================================${NC}"
-        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.5.0             ${NC}"
+        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.8.0             ${NC}"
         echo -e "${GREEN}===================================================${NC}"
         echo " [1]  🚀 基礎初始化 (安裝 Docker / 建立 docker-data)"
         echo " [2]  🔒 SSH Port 管理 (獨立改 Port / 雙 Port 防鎖死)"
