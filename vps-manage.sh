@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Boss 的 VPS 智囊管理腳本 v2.3
-# 功能：全套系統初始化、安全防護、Docker管理、進階運維選單
+# Boss 的 VPS 智囊管理腳本 v2.3.2 (Full Audit & Release)
+# 功能：全套系統初始化、SSH安全、Docker管理、進階運維選單
 # ===================================================
 
 RED='\033[0;31m'
@@ -18,6 +18,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 pause_prompt() {
+    echo ""
     read -p "按下 Enter 鍵繼續..." temp
 }
 
@@ -59,14 +60,16 @@ setup_ssh_port() {
         echo "Port 22" >> /etc/ssh/sshd_config
         echo "Port $NEW_PORT" >> /etc/ssh/sshd_config
 
-        ufw allow $NEW_PORT/tcp > /dev/null 2>&1
+        if command -v ufw &> /dev/null; then
+            ufw allow $NEW_PORT/tcp > /dev/null 2>&1
+        fi
         systemctl restart sshd
         echo -e "${GREEN}✓ 已開啟雙 Port (22 與 $NEW_PORT)${NC}"
         echo -e "${YELLOW}👉 請【開啟新 Terminal】測試是否能用 Port $NEW_PORT 成功登入！${NC}"
         read -p "測試成功？是否關閉舊 Port 22？(y/N): " close_22
         if [[ "$close_22" =~ ^[Yy]$ ]]; then
             sed -i '/^Port 22$/d' /etc/ssh/sshd_config
-            ufw delete allow 22/tcp > /dev/null 2>&1
+            [ -x "$(command -v ufw)" ] && ufw delete allow 22/tcp > /dev/null 2>&1
             systemctl restart sshd
             echo -e "${GREEN}✓ 已安全關閉 Port 22！${NC}"
         fi
@@ -108,8 +111,8 @@ manage_ssh_keys() {
         echo " [0] 返回主選單"
         read -p "請選擇 [0-5]: " key_choice
 
-        mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys
-        chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
 
         case $key_choice in
             1)
@@ -289,7 +292,7 @@ backup_and_migrate() {
     pause_prompt
 }
 
-# 8. 系統效能與網路速測 (帶選單4一鍵全套)
+# 8. 系統效能與網路速測
 test_performance() {
     while true; do
         clear
@@ -444,8 +447,31 @@ manage_swap() {
     done
 }
 
-# 11. UFW 防火牆常用 Port 管理
+# 11. UFW 防火牆常用 Port 管理 (含自由選擇安裝機制)
+check_and_install_ufw() {
+    if ! command -v ufw &> /dev/null; then
+        echo -e "${YELLOW}⚠️ 偵測到系統尚未安裝 UFW 防火牆。${NC}"
+        read -p "是否現在為你安裝 UFW 防火牆？(y/N): " install_ufw
+        if [[ "$install_ufw" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}正在安裝 UFW...${NC}"
+            apt-get update && apt-get install -y ufw
+            echo -e "${GREEN}✓ UFW 安裝完成！${NC}"
+            return 0
+        else
+            echo -e "${RED}已取消操作，返回主選單。${NC}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 manage_ufw_ports() {
+    check_and_install_ufw
+    if [ $? -ne 0 ]; then
+        pause_prompt
+        return
+    fi
+
     while true; do
         clear
         echo -e "${BLUE}=== 11. UFW 防火牆常用 Port 管理 ===${NC}"
@@ -453,8 +479,10 @@ manage_ufw_ports() {
         echo " [2] 一鍵開放常用 Port (80, 443, 8080, 9000)"
         echo " [3] 手動開放指定 Port"
         echo " [4] 關閉指定 Port"
+        echo " [5] 啟用 UFW 防火牆 (ufw enable)"
+        echo " [6] 停用 UFW 防火牆 (ufw disable)"
         echo " [0] 返回主選單"
-        read -p "請選擇 [0-4]: " ufw_choice
+        read -p "請選擇 [0-6]: " ufw_choice
 
         case $ufw_choice in
             1)
@@ -485,17 +513,26 @@ manage_ufw_ports() {
                 fi
                 pause_prompt
                 ;;
+            5)
+                ufw enable
+                pause_prompt
+                ;;
+            6)
+                ufw disable
+                pause_prompt
+                ;;
             0) break ;;
         esac
     done
 }
 
-# 12. 系統時區選擇與 NTP 對時
+# 12. 系統時區選擇與 NTP 對時 (完全修復 ANSI 亂碼)
 manage_timezone() {
     while true; do
         clear
+        NOW_TIME=$(date)
         echo -e "${BLUE}=== 12. 系統時區選擇與 NTP 對時 ===${NC}"
-        echo " 當前系統時間: ${YELLOW}$(date)${NC}"
+        echo -e "當前系統時間: ${YELLOW}${NOW_TIME}${NC}"
         echo "---------------------------------------------------"
         echo " [1] 切換至 香港/北京 時區 (Asia/Hong_Kong)"
         echo " [2] 切換至 新加坡 時區 (Asia/Singapore)"
@@ -518,24 +555,58 @@ manage_timezone() {
                 ;;
             0) break ;;
         esac
-        echo -e "${GREEN}✓ 當前時間已切換為：$(date)${NC}"
+        if [ "$tz_choice" -ge 1 ] && [ "$tz_choice" -le 5 ]; then
+            echo -e "${GREEN}✓ 當前時間已切換為：$(date)${NC}"
+        fi
         pause_prompt
     done
 }
 
-# 13. BBR 網絡加速
+# 13. BBR 網絡加速管理 (自由選擇與狀態檢測)
 setup_bbr() {
-    echo -e "${BLUE}=== 13. BBR 網絡加速管理 ===${NC}"
-    if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-        echo -e "${GREEN}✓ BBR 已經成功啟用！${NC}"
-    else
-        echo -e "${YELLOW}正在啟用 TCP BBR + fq...${NC}"
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p
-        echo -e "${GREEN}✓ BBR 網絡加速已開啟！${NC}"
-    fi
-    pause_prompt
+    while true; do
+        clear
+        CUR_KERNEL=$(uname -r)
+        CUR_CC=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+        CUR_QDISC=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}')
+        
+        echo -e "${BLUE}=== 13. BBR 網絡加速管理 ===${NC}"
+        echo -e "核心版本: ${YELLOW}${CUR_KERNEL:-未知}${NC}"
+        echo -e "當前擁塞算法: ${YELLOW}${CUR_CC:-預設}${NC}"
+        echo -e "當前隊列算法: ${YELLOW}${CUR_QDISC:-預設}${NC}"
+        echo "---------------------------------------------------"
+        echo " [1] 開啟 原版 BBR + fq"
+        echo " [2] 恢復預設 擁塞算法 (cubic)"
+        echo " [0] 返回主選單"
+        read -p "請選擇 [0-2]: " bbr_choice
+
+        case $bbr_choice in
+            1)
+                if echo "$CUR_CC" | grep -q "bbr"; then
+                    echo -e "${GREEN}✓ BBR 已經在啟用狀態，無需重複開啟！${NC}"
+                else
+                    echo -e "${YELLOW}正在開啟 BBR + fq...${NC}"
+                    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+                    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+                    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+                    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+                    sysctl -p
+                    echo -e "${GREEN}✓ BBR 網絡加速已成功開啟！${NC}"
+                fi
+                pause_prompt
+                ;;
+            2)
+                echo -e "${YELLOW}正在恢復預設 cubic 算法...${NC}"
+                sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+                sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+                echo "net.ipv4.tcp_congestion_control=cubic" >> /etc/sysctl.conf
+                sysctl -p
+                echo -e "${GREEN}✓ 已恢復預設 cubic 算法！${NC}"
+                pause_prompt
+                ;;
+            0) break ;;
+        esac
+    done
 }
 
 # 主選單
@@ -543,7 +614,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${GREEN}===================================================${NC}"
-        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.3               ${NC}"
+        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.3.2             ${NC}"
         echo -e "${GREEN}===================================================${NC}"
         echo " [1]  🚀 基礎初始化 (安裝 Docker / 建立 docker-data)"
         echo " [2]  🔒 SSH Port 管理 (獨立改 Port / 雙 Port 防鎖死)"
@@ -557,7 +628,7 @@ main_menu() {
         echo " [10] 🔄 SWAP 虛擬記憶體動態管理"
         echo " [11] 🧱 UFW 防火牆常用 Port 管理"
         echo " [12] ⏰ 系統時區選擇與 NTP 對時"
-        echo " [13] 📜 BBR 網絡加速一鍵開啟"
+        echo " [13] 📜 BBR 網絡加速管理 (可檢測/切換)"
         echo " [0]  🚪 退出 (Exit)"
         echo -e "${GREEN}===================================================${NC}"
         read -p "請選擇操作 [0-13]: " choice
