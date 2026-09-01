@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Boss 的 VPS 智囊管理腳本 v2.0
-# GitHub 託管版 - 包含 SSH Key 精準管理與 Docker 冷/熱搬機
+# Boss 的 VPS 智囊管理腳本 v2.2
+# 功能：基礎初始化、解耦 SSH Port、密碼防呆、精準 Key 管理、高級 TG 監控
 # ===================================================
 
 RED='\033[0;31m'
@@ -45,8 +45,8 @@ init_system() {
     pause_prompt
 }
 
-# 2. SSH 安全 (雙 Port 防鎖死)
-setup_ssh_security() {
+# 2. SSH Port 管理 (獨立改 Port)
+setup_ssh_port() {
     echo -e "${BLUE}=== 2. SSH Port 管理 (雙 Port 防鎖死) ===${NC}"
     current_port=$(ss -tulpn | grep sshd | awk '{print $5}' | awk -F: '{print $NF}' | head -n 1)
     echo -e "當前 SSH Port: ${YELLOW}${current_port:-22}${NC}"
@@ -71,21 +71,35 @@ setup_ssh_security() {
             echo -e "${GREEN}✓ 已安全關閉 Port 22！${NC}"
         fi
     fi
+    pause_prompt
+}
 
-    read -p "是否禁用 SSH 密碼登入？(y/N): " disable_pwd
-    if [[ "$disable_pwd" =~ ^[Yy]$ ]]; then
+# 3. 獨立：關閉 SSH 密碼登入 (帶 Key 強制防呆)
+disable_ssh_password() {
+    echo -e "${BLUE}=== 3. 關閉 SSH 密碼登入 (安全控管) ===${NC}"
+    
+    if [ ! -s ~/.ssh/authorized_keys ]; then
+        echo -e "${RED}❌ 嚴格警告：偵測到 ~/.ssh/authorized_keys 為空或不存在！${NC}"
+        echo -e "${RED}若此時關閉密碼登入，你將永遠無法登入此 VPS。請先到選項 [4] 注入 SSH Key！${NC}"
+        pause_prompt
+        return
+    fi
+
+    echo -e "${YELLOW}✓ 檢測到已存在 SSH Key，可以安全執行。${NC}"
+    read -p "確定要禁用 SSH 密碼登入，僅允許 Key 登入嗎？(y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
         sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
         systemctl restart sshd
-        echo -e "${GREEN}✓ 已禁用密碼登入${NC}"
+        echo -e "${GREEN}✓ 已成功禁用 SSH 密碼登入${NC}"
     fi
     pause_prompt
 }
 
-# 3. SSH Key 獨立管理 (增/刪/查/還原)
+# 4. SSH Key 獨立管理 (增/刪/查/還原)
 manage_ssh_keys() {
     while true; do
         clear
-        echo -e "${BLUE}=== 3. SSH Key 獨立管理 ===${NC}"
+        echo -e "${BLUE}=== 4. SSH Key 獨立管理 ===${NC}"
         echo " [1] 查看現有 Keys (帶編號)"
         echo " [2] 追加新 Key (Append)"
         echo " [3] 刪除指定編號的 Key (Delete by Line)"
@@ -145,9 +159,9 @@ manage_ssh_keys() {
     done
 }
 
-# 4. Fail2ban 設定
+# 5. Fail2ban 設定
 setup_fail2ban() {
-    echo -e "${BLUE}=== 4. 配置 Fail2ban 防爆破 ===${NC}"
+    echo -e "${BLUE}=== 5. 配置 Fail2ban 防爆破 ===${NC}"
     read -p "請輸入 IP 白名單 (如 Tailscale IP，留空跳過): " MY_IP
     current_port=$(ss -tulpn | grep sshd | awk '{print $5}' | awk -F: '{print $NF}' | head -n 1)
     ssh_port=${current_port:-22}
@@ -170,9 +184,9 @@ EOF
     pause_prompt
 }
 
-# 5. TG SSH Monitor
+# 6. 高級 TG SSH Monitor (帶國家/地區與驗證方式)
 setup_tg_monitor() {
-    echo -e "${BLUE}=== 5. 部署 Telegram SSH 登入監控 ===${NC}"
+    echo -e "${BLUE}=== 6. 部署 Telegram SSH 登入監控 (高級版) ===${NC}"
     read -p "請輸入 TG Bot Token: " TG_BOT_TOKEN
     read -p "請輸入 TG Chat ID: " TG_CHAT_ID
 
@@ -186,7 +200,28 @@ HOSTNAME=\$(hostname)
 DATE=\$(date "+%Y-%m-%d %H:%M:%S")
 
 if [ "\$PAM_TYPE" = "open_session" ]; then
-    TEXT="⚠️ <b>SSH 登入通知</b>%0A%0A<b>伺服器:</b> \$HOSTNAME%0A<b>使用者:</b> \$USER%0A<b>來源 IP:</b> \$IP%0A<b>時間:</b> \$DATE"
+    # 抓取地理位置
+    if [ -n "\$IP" ] && [ "\$IP" != "127.0.0.1" ]; then
+        GEO_INFO=\$(curl -s --connect-timeout 2 "http://ip-api.com/json/\$IP?lang=zh-TW")
+        COUNTRY=\$(echo "\$GEO_INFO" | jq -r '.country // "未知"')
+        CITY=\$(echo "\$GEO_INFO" | jq -r '.city // "未知"')
+        LOCATION="\${COUNTRY}, \${CITY}"
+    else
+        LOCATION="Localhost / Tailscale"
+    fi
+
+    # 判斷驗證方式
+    AUTH_TYPE="未知"
+    LOG_ENTRY=\$(grep "Accepted " /var/log/auth.log | tail -n 1)
+    if echo "\$LOG_ENTRY" | grep -q "publickey"; then
+        AUTH_TYPE="🔑 Public Key"
+    elif echo "\$LOG_ENTRY" | grep -q "password"; then
+        AUTH_TYPE="🔐 Password"
+    fi
+
+    # 發送訊息
+    TEXT="⚠️ <b>SSH 登入通知</b>%0A%0A🖥️ <b>伺服器:</b> \$HOSTNAME%0A👤 <b>使用者:</b> \$USER%0A🛡️ <b>方式:</b> \$AUTH_TYPE%0A🌐 <b>來源 IP:</b> \$IP%0A📍 <b>歸屬地:</b> \$LOCATION%0A⏰ <b>時間:</b> \$DATE"
+    
     curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT_ID}" \
         -d "parse_mode=HTML" \
@@ -197,14 +232,14 @@ EOF
         if ! grep -q "ssh-monitor.sh" /etc/pam.d/sshd; then
             echo "session optional pam_exec.so seteuid $MONITOR_SCRIPT" >> /etc/pam.d/sshd
         fi
-        echo -e "${GREEN}✓ TG SSH 監控部署完成${NC}"
+        echo -e "${GREEN}✓ 高級版 TG SSH 監控部署完成！${NC}"
     fi
     pause_prompt
 }
 
-# 6. Docker 冷/熱打包與搬機推送
+# 7. Docker 冷/熱打包與搬機推送
 backup_and_migrate() {
-    echo -e "${BLUE}=== 6. Docker 服務搬機與備份 ===${NC}"
+    echo -e "${BLUE}=== 7. Docker 服務搬機與備份 ===${NC}"
     echo "當前 $DOCKER_DATA_DIR 下的服務："
     ls -l $DOCKER_DATA_DIR | grep '^d' | awk '{print $9}'
     echo "---------------------------------------------------"
@@ -217,7 +252,6 @@ backup_and_migrate() {
         return
     fi
 
-    # 冷/熱備份選擇
     read -p "是否先停止該容器以確保數據一致 (冷備份)？(y/N): " stop_container
     if [[ "$stop_container" =~ ^[Yy]$ ]]; then
         if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
@@ -230,13 +264,11 @@ backup_and_migrate() {
     tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" "$SERVICE_NAME"
     echo -e "${GREEN}✓ 備份完成：$BACKUP_FILE${NC}"
 
-    # 若剛才停止了容器，打包完自動重啟
     if [[ "$stop_container" =~ ^[Yy]$ ]]; then
         echo -e "${BLUE}正在重啟 Docker 容器...${NC}"
         (cd "$TARGET_DIR" && docker compose up -d)
     fi
 
-    # 搬機推送
     read -p "是否直接傳輸至新 VPS？(y/N): " do_push
     if [[ "$do_push" =~ ^[Yy]$ ]]; then
         read -p "請輸入新 VPS IP (可填 Tailscale IP): " NEW_IP
@@ -265,25 +297,27 @@ main_menu() {
     while true; do
         clear
         echo -e "${GREEN}===================================================${NC}"
-        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.0               ${NC}"
+        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.2               ${NC}"
         echo -e "${GREEN}===================================================${NC}"
         echo " [1] 🚀 基礎初始化 (安裝 Docker / 建立 docker-data)"
-        echo " [2] 🔒 SSH Port 管理 (雙 Port 防鎖死/關密碼)"
-        echo " [3] 🔑 SSH Key 獨立管理 (增/刪/查/一鍵還原)"
-        echo " [4] 🛡️ 配置 Fail2ban 防爆破 (帶 IP 白名單)"
-        echo " [5] 📲 部署 Telegram SSH 登入監控"
-        echo " [6] 📦 Docker 冷/熱打包備份與一鍵搬機"
+        echo " [2] 🔒 SSH Port 管理 (獨立改 Port / 雙 Port 防鎖死)"
+        echo " [3] 🚫 關閉 SSH 密碼登入 (帶 Key 強制防呆)"
+        echo " [4] 🔑 SSH Key 獨立管理 (增/刪/查/一鍵還原)"
+        echo " [5] 🛡️ 配置 Fail2ban 防爆破 (帶 IP 白名單)"
+        echo " [6] 📲 部署 Telegram SSH 登入監控 (帶歸屬地與驗證方式)"
+        echo " [7] 📦 Docker 冷/熱打包備份與一鍵搬機"
         echo " [0] 🚪 退出 (Exit)"
         echo -e "${GREEN}===================================================${NC}"
-        read -p "請選擇操作 [0-6]: " choice
+        read -p "請選擇操作 [0-7]: " choice
 
         case $choice in
             1) init_system ;;
-            2) setup_ssh_security ;;
-            3) manage_ssh_keys ;;
-            4) setup_fail2ban ;;
-            5) setup_tg_monitor ;;
-            6) backup_and_migrate ;;
+            2) setup_ssh_port ;;
+            3) disable_ssh_password ;;
+            4) manage_ssh_keys ;;
+            5) setup_fail2ban ;;
+            6) setup_tg_monitor ;;
+            7) backup_and_migrate ;;
             0) echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
             *) echo -e "${RED}無效選項！${NC}"; sleep 1 ;;
         esac
