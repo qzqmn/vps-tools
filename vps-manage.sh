@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Boss 的 VPS 智囊管理腳本 v2.3.2 (Full Audit & Release)
-# 功能：全套系統初始化、SSH安全、Docker管理、進階運維選單
+# Boss 的 VPS 智囊管理腳本 v2.4.0 (Rclone Deep Integration)
+# 功能：全套系統初始化、SSH安全、Docker管理、進階運維選單、雲端備份還原
 # ===================================================
 
 RED='\033[0;31m'
@@ -20,6 +20,21 @@ fi
 pause_prompt() {
     echo ""
     read -p "按下 Enter 鍵繼續..." temp
+}
+
+# 檢查與安裝 Rclone
+check_and_install_rclone() {
+    if ! command -v rclone &> /dev/null; then
+        echo -e "${YELLOW}⚠️ 偵測到系統尚未安裝 Rclone。${NC}"
+        read -p "是否現在為你安裝 Rclone？(y/N): " install_rc
+        if [[ "$install_rc" =~ ^[Yy]$ ]]; then
+            curl https://rclone.org/install.sh | bash
+            echo -e "${GREEN}✓ Rclone 安裝完成！${NC}"
+        else
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # 1. 基礎初始化
@@ -237,59 +252,201 @@ EOF
     pause_prompt
 }
 
-# 7. Docker 冷/熱打包備份與搬機
+# 7. Docker 服務搬機、雲端同步 (Rclone) 與一鍵還原
 backup_and_migrate() {
-    echo -e "${BLUE}=== 7. Docker 服務搬機與備份 ===${NC}"
-    echo "當前 $DOCKER_DATA_DIR 下的服務："
-    ls -l $DOCKER_DATA_DIR | grep '^d' | awk '{print $9}'
-    echo "---------------------------------------------------"
-    read -p "請輸入要打包的服務資料夾名稱: " SERVICE_NAME
+    while true; do
+        clear
+        echo -e "${BLUE}=== 7. Docker 服務搬機、雲端同步 (Rclone) 與還原 ===${NC}"
+        echo " [1] 打包服務並同步至 雲端網盤 / 新 VPS"
+        echo " [2] 從 Rclone 雲端 / 本機拉取備份並一鍵還原啟動"
+        echo " [3] 配置 / 綁定 Rclone 雲端網盤 (rclone config)"
+        echo " [0] 返回主選單"
+        read -p "請選擇 [0-3]: " sub_choice
 
-    TARGET_DIR="$DOCKER_DATA_DIR/$SERVICE_NAME"
-    if [ ! -d "$TARGET_DIR" ]; then
-        echo -e "${RED}錯誤：資料夾不存在！${NC}"
-        pause_prompt
-        return
-    fi
+        case $sub_choice in
+            1)
+                echo -e "\n當前 $DOCKER_DATA_DIR 下的服務："
+                ls -l $DOCKER_DATA_DIR | grep '^d' | awk '{print "  - "$9}'
+                echo "---------------------------------------------------"
+                read -p "請輸入要打包的服務名稱 (輸入 all 打包全部): " SERVICE_NAME
 
-    read -p "是否先停止該容器以確保數據一致 (冷備份)？(y/N): " stop_container
-    if [[ "$stop_container" =~ ^[Yy]$ ]]; then
-        if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
-            echo -e "${YELLOW}正在停止 Docker 容器...${NC}"
-            (cd "$TARGET_DIR" && docker compose down)
-        fi
-    fi
+                if [ -z "$SERVICE_NAME" ]; then
+                    echo -e "${RED}錯誤：服務名稱不能為空！${NC}"
+                    pause_prompt
+                    continue
+                fi
 
-    BACKUP_FILE="/tmp/${SERVICE_NAME}_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-    tar -czvf "$BACKUP_FILE" -C "$DOCKER_DATA_DIR" "$SERVICE_NAME"
-    echo -e "${GREEN}✓ 備份完成：$BACKUP_FILE${NC}"
+                if [ "$SERVICE_NAME" = "all" ]; then
+                    TARGET_DIR="$DOCKER_DATA_DIR"
+                    BACKUP_FILE="/tmp/docker_data_ALL_$(date +%Y%m%d_%H%M%S).tar.gz"
+                    TAR_CMD="tar -czvf $BACKUP_FILE -C $DOCKER_DATA_DIR ."
+                else
+                    TARGET_DIR="$DOCKER_DATA_DIR/$SERVICE_NAME"
+                    if [ ! -d "$TARGET_DIR" ]; then
+                        echo -e "${RED}錯誤：資料夾 $TARGET_DIR 不存在！${NC}"
+                        pause_prompt
+                        continue
+                    fi
+                    BACKUP_FILE="/tmp/${SERVICE_NAME}_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+                    TAR_CMD="tar -czvf $BACKUP_FILE -C $DOCKER_DATA_DIR $SERVICE_NAME"
 
-    if [[ "$stop_container" =~ ^[Yy]$ ]]; then
-        echo -e "${BLUE}正在重啟 Docker 容器...${NC}"
-        (cd "$TARGET_DIR" && docker compose up -d)
-    fi
+                    read -p "是否先停止該容器以確保數據一致 (冷備份)？(y/N): " stop_container
+                    if [[ "$stop_container" =~ ^[Yy]$ ]]; then
+                        if [ -f "$TARGET_DIR/docker-compose.yml" ] || [ -f "$TARGET_DIR/docker-compose.yaml" ]; then
+                            echo -e "${YELLOW}正在停止 Docker 容器...${NC}"
+                            (cd "$TARGET_DIR" && docker compose down)
+                        fi
+                    fi
+                fi
 
-    read -p "是否直接傳輸至新 VPS？(y/N): " do_push
-    if [[ "$do_push" =~ ^[Yy]$ ]]; then
-        read -p "請輸入新 VPS IP (可填 Tailscale IP): " NEW_IP
-        read -p "請輸入新 VPS SSH Port (預設 22): " NEW_SSH_PORT
-        NEW_SSH_PORT=${NEW_SSH_PORT:-22}
-        read -p "請輸入新 VPS 的 SSH 私鑰路徑 (預設 ~/.ssh/id_rsa，若無直接 Enter): " KEY_PATH
+                echo -e "${BLUE}正在打包中...${NC}"
+                $TAR_CMD > /dev/null 2>&1
+                
+                if [ $? -eq 0 ] && [ -f "$BACKUP_FILE" ]; then
+                    echo -e "${GREEN}✓ 備份成功：$BACKUP_FILE${NC}"
+                else
+                    echo -e "${RED}❌ 打包失敗！請檢查硬碟空間或權限。${NC}"
+                    pause_prompt
+                    continue
+                fi
 
-        SSH_CMD="scp -P $NEW_SSH_PORT"
-        [ -n "$KEY_PATH" ] && SSH_CMD="scp -i $KEY_PATH -P $NEW_SSH_PORT"
+                if [ "$SERVICE_NAME" != "all" ] && [[ "$stop_container" =~ ^[Yy]$ ]]; then
+                    echo -e "${BLUE}正在重啟 Docker 容器...${NC}"
+                    (cd "$TARGET_DIR" && docker compose up -d)
+                fi
 
-        echo -e "${BLUE}正在傳輸至新 VPS /tmp 目錄...${NC}"
-        $SSH_CMD "$BACKUP_FILE" "root@$NEW_IP:/tmp/"
-        
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✓ 檔案已成功傳送至新 VPS 的 /tmp 目錄！${NC}"
-            echo -e "${YELLOW}請在新 VPS 執行：tar -xzvf /tmp/$(basename $BACKUP_FILE) -C /docker-data/${NC}"
-        else
-            echo -e "${RED}傳輸失敗，請檢查網絡連線或 SSH Key 權限。${NC}"
-        fi
-    fi
-    pause_prompt
+                # 上傳至 Rclone 雲端
+                if command -v rclone &> /dev/null; then
+                    read -p "是否同步備份檔至 Rclone 雲端網盤？(y/N): " do_rclone
+                    if [[ "$do_rclone" =~ ^[Yy]$ ]]; then
+                        echo -e "${YELLOW}現有 Rclone Remote 清單：${NC}"
+                        rclone listremotes
+                        read -p "請輸入 Remote 名稱與目標路徑 (例如 drive:/backup): " RCLONE_PATH
+                        if [ -n "$RCLONE_PATH" ]; then
+                            echo -e "${BLUE}正在上傳至雲端...${NC}"
+                            rclone copy "$BACKUP_FILE" "$RCLONE_PATH"
+                            if [ $? -eq 0 ]; then
+                                echo -e "${GREEN}✓ 已成功同步上傳至 $RCLONE_PATH！${NC}"
+                            else
+                                echo -e "${RED}❌ Rclone 上傳失敗，請檢查路徑與配置。${NC}"
+                            fi
+                        fi
+                    fi
+                fi
+
+                # SCP 傳送至新 VPS
+                read -p "是否直接 SCP 傳輸至新 VPS？(y/N): " do_push
+                if [[ "$do_push" =~ ^[Yy]$ ]]; then
+                    read -p "請輸入新 VPS IP (可填 Tailscale IP): " NEW_IP
+                    read -p "請輸入新 VPS SSH Port (預設 22): " NEW_SSH_PORT
+                    NEW_SSH_PORT=${NEW_SSH_PORT:-22}
+                    read -p "請輸入 SSH 私鑰路徑 (預設 ~/.ssh/id_rsa，若無直接 Enter): " KEY_PATH
+
+                    SSH_CMD="scp -P $NEW_SSH_PORT"
+                    [ -n "$KEY_PATH" ] && SSH_CMD="scp -i $KEY_PATH -P $NEW_SSH_PORT"
+
+                    echo -e "${BLUE}正在傳輸至新 VPS /tmp 目錄...${NC}"
+                    $SSH_CMD "$BACKUP_FILE" "root@$NEW_IP:/tmp/"
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ 檔案已成功傳送至新 VPS 的 /tmp 目錄！${NC}"
+                    else
+                        echo -e "${RED}傳輸失敗，請檢查網絡連線或 SSH Key 權限。${NC}"
+                    fi
+                fi
+                pause_prompt
+                ;;
+
+            2)
+                echo -e "\n${BLUE}--- 還原備份檔至本機 ---${NC}"
+                SELECTED_FILE=""
+
+                if command -v rclone &> /dev/null; then
+                    read -p "是否從 Rclone 雲端網盤下載備份檔？(y/N): " from_cloud
+                    if [[ "$from_cloud" =~ ^[Yy]$ ]]; then
+                        echo -e "${YELLOW}現有 Rclone Remote 清單：${NC}"
+                        rclone listremotes
+                        read -p "請輸入 Remote 路徑 (例如 drive:/backup): " CLOUD_PATH
+                        if [ -n "$CLOUD_PATH" ]; then
+                            echo -e "${YELLOW}遠端目錄中的檔案：${NC}"
+                            rclone ls "$CLOUD_PATH"
+                            read -p "請輸入要下載的檔案完整檔名 (例如 vaultwarden_backup.tar.gz): " CLOUD_FILE
+                            
+                            echo -e "${BLUE}正在從雲端拉取檔案...${NC}"
+                            rclone copy "$CLOUD_PATH/$CLOUD_FILE" /tmp/
+                            if [ $? -eq 0 ] && [ -f "/tmp/$CLOUD_FILE" ]; then
+                                echo -e "${GREEN}✓ 下載成功！${NC}"
+                                SELECTED_FILE="/tmp/$CLOUD_FILE"
+                            else
+                                echo -e "${RED}❌ 從雲端下載失敗！${NC}"
+                                pause_prompt
+                                continue
+                            fi
+                        fi
+                    fi
+                fi
+
+                # 若沒有從雲端下載，則掃描本機 /tmp
+                if [ -z "$SELECTED_FILE" ]; then
+                    echo "掃描 /tmp/ 目錄下的備份檔："
+                    BACKUP_LIST=($(ls /tmp/*.tar.gz 2>/dev/null))
+                    
+                    if [ ${#BACKUP_LIST[@]} -eq 0 ]; then
+                        read -p "在 /tmp/ 找不到備份檔，請手動輸入備份檔完整路徑: " MANUAL_PATH
+                        SELECTED_FILE="$MANUAL_PATH"
+                    else
+                        for i in "${!BACKUP_LIST[@]}"; do
+                            echo " [$i] ${BACKUP_LIST[$i]}"
+                        done
+                        read -p "請選擇要還原的檔案編號 [0-$((${#BACKUP_LIST[@]}-1))]: " file_idx
+                        SELECTED_FILE="${BACKUP_LIST[$file_idx]}"
+                    fi
+                fi
+
+                if [ ! -f "$SELECTED_FILE" ]; then
+                    echo -e "${RED}錯誤：檔案 $SELECTED_FILE 不存在！${NC}"
+                    pause_prompt
+                    continue
+                fi
+
+                echo -e "${BLUE}正在解壓 $SELECTED_FILE 到 $DOCKER_DATA_DIR ...${NC}"
+                mkdir -p "$DOCKER_DATA_DIR"
+                tar -xzvf "$SELECTED_FILE" -C "$DOCKER_DATA_DIR"
+                
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ 解壓完成！${NC}"
+                    
+                    read -p "請輸入剛剛還原的服務資料夾名稱 (用於啟動 Compose): " RESTORED_NAME
+                    RESTORED_DIR="$DOCKER_DATA_DIR/$RESTORED_NAME"
+                    
+                    if [ -d "$RESTORED_DIR" ]; then
+                        if [ -f "$RESTORED_DIR/docker-compose.yml" ] || [ -f "$RESTORED_DIR/docker-compose.yaml" ]; then
+                            read -p "偵測到 docker-compose 檔，是否立即啟動服務？(Y/n): " start_now
+                            if [[ ! "$start_now" =~ ^[Nn]$ ]]; then
+                                echo -e "${BLUE}正在啟動服務...${NC}"
+                                (cd "$RESTORED_DIR" && docker compose up -d)
+                                echo -e "${GREEN}✓ 服務已成功啟動！${NC}"
+                            fi
+                        fi
+                    else
+                        echo -e "${YELLOW}! 提示：$DOCKER_DATA_DIR/$RESTORED_NAME 目錄不存在，無法自動執行 compose。${NC}"
+                    fi
+                else
+                    echo -e "${RED}❌ 解壓失敗，請檢查檔案是否完整。${NC}"
+                fi
+                pause_prompt
+                ;;
+
+            3)
+                check_and_install_rclone
+                if [ $? -eq 0 ]; then
+                    rclone config
+                fi
+                pause_prompt
+                ;;
+
+            0) break ;;
+        esac
+    done
 }
 
 # 8. 系統效能與網路速測
@@ -526,7 +683,7 @@ manage_ufw_ports() {
     done
 }
 
-# 12. 系統時區選擇與 NTP 對時 (完全修復 ANSI 亂碼)
+# 12. 系統時區選擇與 NTP 對時
 manage_timezone() {
     while true; do
         clear
@@ -562,7 +719,7 @@ manage_timezone() {
     done
 }
 
-# 13. BBR 網絡加速管理 (自由選擇與狀態檢測)
+# 13. BBR 網絡加速管理
 setup_bbr() {
     while true; do
         clear
@@ -614,7 +771,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${GREEN}===================================================${NC}"
-        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.3.2             ${NC}"
+        echo -e "${GREEN}       Boss 的 VPS 智囊管理腳本 v2.4.0             ${NC}"
         echo -e "${GREEN}===================================================${NC}"
         echo " [1]  🚀 基礎初始化 (安裝 Docker / 建立 docker-data)"
         echo " [2]  🔒 SSH Port 管理 (獨立改 Port / 雙 Port 防鎖死)"
@@ -622,7 +779,7 @@ main_menu() {
         echo " [4]  🔑 SSH Key 獨立管理 (增/刪/查/一鍵還原)"
         echo " [5]  🛡️ 配置 Fail2ban 防爆破 (帶 IP 白名單)"
         echo " [6]  📲 部署 Telegram SSH 登入監控 (高級版)"
-        echo " [7]  📦 Docker 冷/熱打包備份與一鍵搬機"
+        echo " [7]  📦 Docker 服務搬機、雲端同步 (Rclone) 與還原"
         echo " [8]  🧪 系統效能與網絡速測 (支援一鍵全套)"
         echo " [9]  🐳 Docker 服務管理與系統垃圾清理"
         echo " [10] 🔄 SWAP 虛擬記憶體動態管理"
